@@ -3,8 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, urlunparse
 import databases
 import sqlalchemy
+import psycopg2
 import hashlib
 import secrets
 import os
@@ -18,6 +20,39 @@ if DATABASE_URL.startswith("postgres://"):
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change_me_in_production_please")
 ADMIN_KEY  = os.getenv("ADMIN_KEY",  "glitchdlc_admin_secret")
+
+
+def ensure_database_exists(url: str):
+    """Если базы из URL не существует — создаём её, подключаясь к 'postgres'."""
+    if not url.startswith("postgresql"):
+        return  # для sqlite ничего делать не надо
+
+    parsed = urlparse(url)
+    db_name = parsed.path.lstrip("/")
+    if not db_name or db_name == "postgres":
+        return
+
+    admin_url = urlunparse(parsed._replace(path="/postgres"))
+
+    try:
+        conn = psycopg2.connect(admin_url)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
+        if cur.fetchone() is None:
+            print(f"[GlitchDLC] Database '{db_name}' missing — creating...", flush=True)
+            cur.execute(f'CREATE DATABASE "{db_name}"')
+            print(f"[GlitchDLC] Database '{db_name}' created", flush=True)
+        else:
+            print(f"[GlitchDLC] Database '{db_name}' OK", flush=True)
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[GlitchDLC] ensure_database_exists FAILED: {type(e).__name__}: {e}", flush=True)
+
+
+# Создаём базу до того как подключимся
+ensure_database_exists(DATABASE_URL)
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 database = databases.Database(DATABASE_URL)
