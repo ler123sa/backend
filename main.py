@@ -56,19 +56,25 @@ sessions = sqlalchemy.Table(
     sqlalchemy.Column("expires_at", sqlalchemy.DateTime,    nullable=False),
 )
 
-engine = sqlalchemy.create_engine(
-    DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
-    if "postgresql" in DATABASE_URL
-    else DATABASE_URL
-)
+engine = sqlalchemy.create_engine(DATABASE_URL)
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await database.connect()
-    metadata.create_all(engine)
-    # Создаём owner аккаунт если его нет
-    await ensure_owner()
+    print("[GlitchDLC] Starting up...")
+    print(f"[GlitchDLC] DB URL prefix: {DATABASE_URL[:30]}...")
+    try:
+        await database.connect()
+        print("[GlitchDLC] Database connected")
+        metadata.create_all(engine)
+        print("[GlitchDLC] Tables created")
+        await ensure_owner()
+        print("[GlitchDLC] Startup complete")
+    except Exception as e:
+        print(f"[GlitchDLC] STARTUP ERROR: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     yield
     await database.disconnect()
 
