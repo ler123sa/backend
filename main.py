@@ -457,10 +457,15 @@ async def admin_list_users(admin=Depends(require_admin)):
 
 @app.post("/api/admin/subscription/grant")
 async def admin_grant_subscription(request: Request, admin=Depends(require_admin)):
+    """
+    Выдать подписку.
+    plan: month / quarter / lifetime  (или явно days=N)
+    days: число дней (если задано — переопределяет plan)
+    """
     data = await request.json()
-    user_id  = data.get("user_id")
-    plan     = data.get("plan", "basic")       # basic / premium / lifetime
-    days     = data.get("days")                # None = lifetime
+    user_id = data.get("user_id")
+    plan    = (data.get("plan") or "").lower()
+    days    = data.get("days")
 
     if not user_id:
         raise HTTPException(400, "user_id required")
@@ -469,6 +474,20 @@ async def admin_grant_subscription(request: Request, admin=Depends(require_admin
     if not user:
         raise HTTPException(404, "User not found")
 
+    # Дефолтные сроки
+    PLAN_DAYS = {
+        "month":    30,
+        "quarter":  90,
+        "lifetime": None,   # бессрочно
+    }
+
+    if days is None:
+        if plan not in PLAN_DAYS:
+            raise HTTPException(400, "plan must be one of: month, quarter, lifetime (or set 'days')")
+        days = PLAN_DAYS[plan]
+    if not plan:
+        plan = "custom"
+
     # Деактивируем старые подписки
     await database.execute(
         subscriptions.update()
@@ -476,7 +495,7 @@ async def admin_grant_subscription(request: Request, admin=Depends(require_admin
         .values(active=False)
     )
 
-    expires = None if (days is None or plan == "lifetime") else datetime.utcnow() + timedelta(days=int(days))
+    expires = None if days is None else datetime.utcnow() + timedelta(days=int(days))
 
     await database.execute(subscriptions.insert().values(
         user_id=user_id,
@@ -485,7 +504,11 @@ async def admin_grant_subscription(request: Request, admin=Depends(require_admin
         active=True,
     ))
 
-    return {"success": True, "message": f"Подписка {plan} выдана пользователю {user['username']}"}
+    return {
+        "success": True,
+        "message": f"Подписка {plan} выдана пользователю {user['username']}",
+        "expires_at": expires.isoformat() if expires else None,
+    }
 
 
 @app.post("/api/admin/user/ban")
@@ -521,6 +544,125 @@ async def admin_reset_hwid(request: Request, admin=Depends(require_admin)):
         users.update().where(users.c.id == user_id).values(hwid=None)
     )
     return {"success": True, "message": "HWID сброшен"}
+
+
+@app.post("/api/admin/user/role")
+async def admin_set_role(request: Request, admin=Depends(require_admin)):
+    """Назначить роль (user / admin). Owner трогать нельзя — только owner может."""
+    data = await request.json()
+    user_id  = data.get("user_id")
+    new_role = data.get("role", "user")
+
+    if new_role not in ("user", "admin", "owner"):
+        raise HTTPException(400, "Invalid role")
+    if new_role == "owner" and admin["role"] != "owner":
+        raise HTTPException(403, "Only owner can grant owner role")
+
+    target = await database.fetch_one(users.select().where(users.c.id == user_id))
+    if not target:
+        raise HTTPException(404, "User not found")
+    if target["role"] == "owner" and admin["role"] != "owner":
+        raise HTTPException(403, "Cannot modify owner")
+
+    await database.execute(
+        users.update().where(users.c.id == user_id).values(role=new_role)
+    )
+    return {"success": True, "message": f"Роль изменена на {new_role}"}
+
+
+@app.post("/api/admin/user/delete")
+async def admin_delete_user(request: Request, admin=Depends(require_admin)):
+    """Удаляет пользователя со всеми его сессиями и подписками."""
+    data = await request.json()
+    user_id = data.get("user_id")
+
+    target = await database.fetch_one(users.select().where(users.c.id == user_id))
+    if not target:
+        raise HTTPException(404, "User not found")
+    if target["role"] == "owner":
+        raise HTTPException(403, "Cannot delete owner")
+    if target["id"] == admin["id"]:
+        raise HTTPException(403, "Cannot delete yourself")
+
+    await database.execute(sessions.delete().where(sessions.c.user_id == user_id))
+    await database.execute(subscriptions.delete().where(subscriptions.c.user_id == user_id))
+    await database.execute(users.delete().where(users.c.id == user_id))
+    return {"success": True, "message": "Пользователь удалён"}
+
+
+@app.post("/api/admin/subscription/revoke")
+async def admin_revoke_subscription(request: Request, admin=Depends(require_admin)):
+    """Деактивирует все подписки пользователя."""
+    data = await request.json()
+    user_id = data.get("user_id")
+    await database.execute(
+        subscriptions.update()
+        .where(subscriptions.c.user_id == user_id)
+        .values(active=False)
+    )
+    return {"success": True, "message": "Подписка отозвана"}
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(admin=Depends(require_admin)):
+    """Сводка для админ-дашборда."""
+    total_users  = await database.fetch_val("SELECT COUNT(*) FROM users")
+    banned_users = await database.fetch_val("SELECT COUNT(*) FROM users WHERE banned = TRUE" if IS_POSTGRES else "SELECT COUNT(*) FROM users WHERE banned = 1")
+    active_subs  = await database.fetch_val(
+        "SELECT COUNT(*) FROM subscriptions WHERE active = TRUE AND (expires_at IS NULL OR expires_at > NOW())"
+        if IS_POSTGRES else
+        "SELECT COUNT(*) FROM subscriptions WHERE active = 1 AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)"
+    )
+    lifetime_subs = await database.fetch_val(
+        "SELECT COUNT(*) FROM subscriptions WHERE active = TRUE AND expires_at IS NULL"
+        if IS_POSTGRES else
+        "SELECT COUNT(*) FROM subscriptions WHERE active = 1 AND expires_at IS NULL"
+    )
+    return {
+        "users":         total_users  or 0,
+        "banned":        banned_users or 0,
+        "active_subs":   active_subs  or 0,
+        "lifetime_subs": lifetime_subs or 0,
+    }
+
+
+@app.get("/api/admin/user/{user_id}")
+async def admin_get_user(user_id: int, admin=Depends(require_admin)):
+    """Детальная инфа по одному пользователю."""
+    u = await database.fetch_one(users.select().where(users.c.id == user_id))
+    if not u:
+        raise HTTPException(404, "User not found")
+    sub = await get_active_subscription(user_id)
+    history = await database.fetch_all(
+        subscriptions.select().where(subscriptions.c.user_id == user_id)
+        .order_by(subscriptions.c.created_at.desc())
+    )
+    return {
+        "id":       u["id"],
+        "username": u["username"],
+        "email":    u["email"],
+        "role":     u["role"],
+        "hwid":     u["hwid"],
+        "banned":   u["banned"],
+        "ban_reason": u["ban_reason"],
+        "created_at": u["created_at"].isoformat() if u["created_at"] else None,
+        "subscription": {
+            "active":     sub is not None,
+            "plan":       sub["plan"] if sub else None,
+            "expires_at": sub["expires_at"].isoformat() if sub and sub["expires_at"] else None,
+            "lifetime":   sub is not None and sub["expires_at"] is None,
+        },
+        "history": [
+            {
+                "id":         s["id"],
+                "plan":       s["plan"],
+                "active":     s["active"],
+                "expires_at": s["expires_at"].isoformat() if s["expires_at"] else None,
+                "created_at": s["created_at"].isoformat() if s["created_at"] else None,
+            }
+            for s in history
+        ]
+    }
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
