@@ -61,22 +61,25 @@ engine = sqlalchemy.create_engine(DATABASE_URL)
 # ─── App ──────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[GlitchDLC] Starting up...")
-    print(f"[GlitchDLC] DB URL prefix: {DATABASE_URL[:30]}...")
+    print("[GlitchDLC] Starting up...", flush=True)
+    print(f"[GlitchDLC] DB URL prefix: {DATABASE_URL[:40]}...", flush=True)
     try:
         await database.connect()
-        print("[GlitchDLC] Database connected")
+        print("[GlitchDLC] Database connected", flush=True)
         metadata.create_all(engine)
-        print("[GlitchDLC] Tables created")
+        print("[GlitchDLC] Tables created", flush=True)
         await ensure_owner()
-        print("[GlitchDLC] Startup complete")
+        print("[GlitchDLC] Startup complete", flush=True)
     except Exception as e:
-        print(f"[GlitchDLC] STARTUP ERROR: {type(e).__name__}: {e}")
+        print(f"[GlitchDLC] STARTUP ERROR: {type(e).__name__}: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        raise
+        # Не падаем — даём API хотя бы отвечать на /
     yield
-    await database.disconnect()
+    try:
+        await database.disconnect()
+    except Exception:
+        pass
 
 app = FastAPI(title="GlitchDLC API", version="1.0.0", lifespan=lifespan)
 
