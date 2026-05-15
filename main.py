@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import databases
 import sqlalchemy
-from sqlalchemy.ext.asyncio import create_async_engine
 import hashlib
 import secrets
 import os
@@ -17,17 +16,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./glitchdlc.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# для async create_all нам нужен +asyncpg драйвер
-def _to_async_url(url: str) -> str:
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if url.startswith("sqlite:///"):
-        return url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
-    return url
-
-ASYNC_DATABASE_URL = _to_async_url(DATABASE_URL)
+IS_POSTGRES = DATABASE_URL.startswith("postgresql")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change_me_in_production_please")
 ADMIN_KEY  = os.getenv("ADMIN_KEY",  "glitchdlc_admin_secret")
@@ -69,7 +58,86 @@ sessions = sqlalchemy.Table(
     sqlalchemy.Column("expires_at", sqlalchemy.DateTime,    nullable=False),
 )
 
-engine = create_async_engine(ASYNC_DATABASE_URL, echo=False)
+# ─── Schema (raw SQL, чтобы создать таблицы тем же asyncpg-соединением) ──────
+def _schema_sql() -> list[str]:
+    if IS_POSTGRES:
+        return [
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id            SERIAL PRIMARY KEY,
+                username      VARCHAR(32)  UNIQUE NOT NULL,
+                email         VARCHAR(128) UNIQUE NOT NULL,
+                password_hash VARCHAR(128) NOT NULL,
+                hwid          VARCHAR(128),
+                role          VARCHAR(16) DEFAULT 'user',
+                created_at    TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                banned        BOOLEAN DEFAULT FALSE,
+                ban_reason    VARCHAR(256)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id         SERIAL PRIMARY KEY,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                plan       VARCHAR(32) DEFAULT 'basic',
+                expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                active     BOOLEAN DEFAULT TRUE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id         SERIAL PRIMARY KEY,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token      VARCHAR(128) UNIQUE NOT NULL,
+                hwid       VARCHAR(128),
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                expires_at TIMESTAMP NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_sessions_token   ON sessions(token)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_subs_user_id     ON subscriptions(user_id)",
+        ]
+    else:
+        return [
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      VARCHAR(32)  UNIQUE NOT NULL,
+                email         VARCHAR(128) UNIQUE NOT NULL,
+                password_hash VARCHAR(128) NOT NULL,
+                hwid          VARCHAR(128),
+                role          VARCHAR(16) DEFAULT 'user',
+                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                banned        BOOLEAN DEFAULT 0,
+                ban_reason    VARCHAR(256)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                plan       VARCHAR(32) DEFAULT 'basic',
+                expires_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                active     BOOLEAN DEFAULT 1,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                token      VARCHAR(128) UNIQUE NOT NULL,
+                hwid       VARCHAR(128),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """,
+        ]
+
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -79,9 +147,8 @@ async def lifespan(app: FastAPI):
     try:
         await database.connect()
         print("[GlitchDLC] Database connected", flush=True)
-        # создаём таблицы через async-движок (через тот же asyncpg, без psycopg2)
-        async with engine.begin() as conn:
-            await conn.run_sync(metadata.create_all)
+        for stmt in _schema_sql():
+            await database.execute(stmt)
         print("[GlitchDLC] Tables created", flush=True)
         await ensure_owner()
         print("[GlitchDLC] Startup complete", flush=True)
@@ -93,7 +160,6 @@ async def lifespan(app: FastAPI):
     yield
     try:
         await database.disconnect()
-        await engine.dispose()
     except Exception:
         pass
 
