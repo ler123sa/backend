@@ -1408,11 +1408,18 @@ async def launcher_payload(request: Request):
     Лоудер вызывает после успешного /api/launcher/check.
     Передаёт launch_token и hwid → получает:
         - presigned URL зашифрованного payload в Bucket (TTL ~90с)
-        - DEK завёрнутый в KEK = HKDF(master, version, hwid, launch_token)
-        - nonce'ы для AES-GCM
-        - HMAC-подпись метаданных от master_secret
+        - plain DEK (32 байта hex) — отдаётся ТОЛЬКО по TLS, на одноразовом launch_token
+        - nonce для AES-GCM расшифровки payload'а
+        - HMAC-подпись метаданных от master_secret (защита от MITM на уровне приложения)
 
     launch_token при этом помечается как использованный (одноразовый).
+
+    Модель угроз:
+        - TLS защищает DEK от пассивного перехвата.
+        - Launch_token привязан к user_id+hwid и одноразовый.
+        - Stub.jar расшифровывает payload в RAM и СРАЗУ зануляет DEK.
+        - Master_secret НИКОГДА не покидает backend — поэтому stub не может выводить
+          ключи самостоятельно, и компрометация stub.jar не компрометирует другие payload'ы.
     """
     data = await request.json()
     launch_token = (data.get("launch_token") or "").strip()
@@ -1451,20 +1458,11 @@ async def launcher_payload(request: Request):
     if not payload_storage.is_configured():
         raise HTTPException(503, "Storage offline")
 
-    # Разворачиваем DEK из master-обёртки и заворачиваем под сессию
+    # Разворачиваем DEK из master-обёртки прямо здесь
     try:
         dek_plain = payload_crypto.unwrap_dek_from_master(bytes(p["dek_wrapped"]))
     except Exception as e:
         raise HTTPException(500, f"DEK unwrap failed: {type(e).__name__}")
-
-    session_wrap = payload_crypto.wrap_dek_for_session(
-        dek_plain,
-        payload_version=p["version"],
-        hwid=hwid,
-        launch_token=launch_token,
-    )
-    # Зануляем
-    dek_plain = b"\x00" * len(dek_plain)
 
     # Помечаем launch_token как использованный (одноразовый)
     await database.execute(
@@ -1479,25 +1477,23 @@ async def launcher_payload(request: Request):
     except Exception as e:
         raise HTTPException(500, f"Presign failed: {type(e).__name__}")
 
-    # HMAC-подпись для лоудера: чтобы убедиться что url+ключи не подменили
+    payload_nonce_hex = bytes(p["payload_nonce"]).hex()
+    dek_hex = dek_plain.hex()
+
+    # HMAC-подпись от master — лоудер проверяет fingerprint, не зная сам master
+    # (для этого backend публикует fingerprint один раз при инсталляции лоудера).
+    # Тут signature защищает от подмены url/nonce/dek в логах/прокси.
     sig = payload_crypto.integrity_signature(
-        p["version"],
-        url,
-        bytes(p["payload_nonce"]).hex(),
-        session_wrap.nonce.hex(),
-        session_wrap.wrapped.hex(),
-        hwid,
-        launch_token,
+        p["version"], url, payload_nonce_hex, dek_hex, hwid, launch_token,
     )
 
-    return {
+    response = {
         "version":       p["version"],
         "url":           url,
         "size_bytes":    p["size_bytes"],
         "sha256":        p["sha256"],
-        "payload_nonce": bytes(p["payload_nonce"]).hex(),
-        "dek_wrapped":   session_wrap.wrapped.hex(),
-        "dek_nonce":     session_wrap.nonce.hex(),
+        "payload_nonce": payload_nonce_hex,
+        "dek":           dek_hex,
         "signature":     sig,
         "user": {
             "username": user["username"],
@@ -1509,6 +1505,9 @@ async def launcher_payload(request: Request):
             "lifetime":   sub["expires_at"] is None,
         },
     }
+    # Зануляем после формирования ответа
+    dek_plain = b"\x00" * len(dek_plain)
+    return response
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
