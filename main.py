@@ -68,6 +68,18 @@ releases = sqlalchemy.Table(
     sqlalchemy.Column("active",     sqlalchemy.Boolean,     default=True),
 )
 
+keys = sqlalchemy.Table(
+    "keys", metadata,
+    sqlalchemy.Column("id",          sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("code",        sqlalchemy.String(64),  unique=True, nullable=False),
+    sqlalchemy.Column("plan",        sqlalchemy.String(32),  nullable=False),     # month / quarter / lifetime / hwid_reset
+    sqlalchemy.Column("days",        sqlalchemy.Integer,     nullable=True),      # NULL = lifetime, иначе сколько дней
+    sqlalchemy.Column("note",        sqlalchemy.String(128), nullable=True),      # пометка для админа (партия, источник)
+    sqlalchemy.Column("created_at",  sqlalchemy.DateTime,    default=datetime.utcnow),
+    sqlalchemy.Column("activated_at",sqlalchemy.DateTime,    nullable=True),
+    sqlalchemy.Column("activated_by",sqlalchemy.Integer,     sqlalchemy.ForeignKey("users.id"), nullable=True),
+)
+
 # ─── Schema (raw SQL, чтобы создать таблицы тем же asyncpg-соединением) ──────
 def _schema_sql() -> list[str]:
     if IS_POSTGRES:
@@ -119,6 +131,20 @@ def _schema_sql() -> list[str]:
             )
             """,
             "CREATE INDEX IF NOT EXISTS idx_releases_active ON releases(active)",
+            """
+            CREATE TABLE IF NOT EXISTS keys (
+                id            SERIAL PRIMARY KEY,
+                code          VARCHAR(64)  UNIQUE NOT NULL,
+                plan          VARCHAR(32)  NOT NULL,
+                days          INTEGER,
+                note          VARCHAR(128),
+                created_at    TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                activated_at  TIMESTAMP,
+                activated_by  INTEGER REFERENCES users(id) ON DELETE SET NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_keys_code         ON keys(code)",
+            "CREATE INDEX IF NOT EXISTS idx_keys_activated_by ON keys(activated_by)",
         ]
     else:
         return [
@@ -165,6 +191,19 @@ def _schema_sql() -> list[str]:
                 notes      TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 active     BOOLEAN DEFAULT 1
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS keys (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                code          VARCHAR(64)  UNIQUE NOT NULL,
+                plan          VARCHAR(32)  NOT NULL,
+                days          INTEGER,
+                note          VARCHAR(128),
+                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                activated_at  DATETIME,
+                activated_by  INTEGER,
+                FOREIGN KEY(activated_by) REFERENCES users(id)
             )
             """,
         ]
@@ -790,6 +829,171 @@ async def admin_activate_release(request: Request, admin=Depends(require_admin))
         releases.update().where(releases.c.id == release_id).values(active=True)
     )
     return {"success": True, "message": f"Релиз {rel['version']} активирован"}
+
+
+# ─── Keys (FunPay-стиль активация) ────────────────────────────────────────────
+import string
+
+PLAN_DAYS_MAP = {
+    "month":      30,
+    "quarter":    90,
+    "lifetime":   None,
+    "hwid_reset": 0,    # специальный: подписку не выдаёт, только сбрасывает HWID
+}
+
+def _generate_key_code() -> str:
+    """Формат: GDLC-XXXX-XXXX-XXXX-XXXX (16 символов A-Z 0-9)"""
+    alphabet = string.ascii_uppercase + string.digits
+    parts = []
+    for _ in range(4):
+        parts.append("".join(secrets.choice(alphabet) for _ in range(4)))
+    return "GDLC-" + "-".join(parts)
+
+
+@app.post("/api/keys/activate")
+async def keys_activate(request: Request, user=Depends(get_current_user)):
+    """Юзер активирует ключ — выдаётся подписка либо сбрасывается HWID."""
+    data = await request.json()
+    code = (data.get("code") or "").strip().upper()
+
+    if not code:
+        raise HTTPException(400, "Введите ключ")
+
+    key = await database.fetch_one(keys.select().where(keys.c.code == code))
+    if not key:
+        raise HTTPException(404, "Ключ не найден")
+    if key["activated_at"] is not None:
+        raise HTTPException(400, "Этот ключ уже использован")
+
+    plan = key["plan"]
+    days = key["days"]
+
+    # Особый ключ — сброс HWID
+    if plan == "hwid_reset":
+        await database.execute(
+            users.update().where(users.c.id == user["id"]).values(hwid=None)
+        )
+        await database.execute(
+            keys.update().where(keys.c.id == key["id"]).values(
+                activated_at=datetime.utcnow(),
+                activated_by=user["id"],
+            )
+        )
+        return {"success": True, "type": "hwid_reset", "message": "HWID сброшен. При следующем входе привяжется новый"}
+
+    # Подписка — деактивируем старые активные подписки и выдаём новую
+    await database.execute(
+        subscriptions.update()
+        .where(subscriptions.c.user_id == user["id"])
+        .values(active=False)
+    )
+
+    expires = None if days is None else datetime.utcnow() + timedelta(days=int(days))
+    await database.execute(subscriptions.insert().values(
+        user_id=user["id"],
+        plan=plan,
+        expires_at=expires,
+        active=True,
+    ))
+
+    await database.execute(
+        keys.update().where(keys.c.id == key["id"]).values(
+            activated_at=datetime.utcnow(),
+            activated_by=user["id"],
+        )
+    )
+
+    return {
+        "success": True,
+        "type": "subscription",
+        "plan": plan,
+        "expires_at": expires.isoformat() if expires else None,
+        "lifetime": expires is None,
+        "message": f"Подписка {plan} активирована",
+    }
+
+
+@app.get("/api/admin/keys")
+async def admin_list_keys(admin=Depends(require_admin)):
+    """Список всех ключей с инфой об активации."""
+    rows = await database.fetch_all(
+        keys.select().order_by(keys.c.created_at.desc())
+    )
+    result = []
+    for k in rows:
+        activated_username = None
+        if k["activated_by"]:
+            u = await database.fetch_one(users.select().where(users.c.id == k["activated_by"]))
+            if u:
+                activated_username = u["username"]
+        result.append({
+            "id":              k["id"],
+            "code":            k["code"],
+            "plan":            k["plan"],
+            "days":            k["days"],
+            "note":            k["note"],
+            "created_at":      k["created_at"].isoformat() if k["created_at"] else None,
+            "activated_at":    k["activated_at"].isoformat() if k["activated_at"] else None,
+            "activated_by":    activated_username,
+            "used":            k["activated_at"] is not None,
+        })
+    return result
+
+
+@app.post("/api/admin/keys/generate")
+async def admin_generate_keys(request: Request, admin=Depends(require_admin)):
+    """
+    Сгенерировать N ключей под план.
+    body: { plan: "month" | "quarter" | "lifetime" | "hwid_reset", count: 10, note?: "FunPay batch 1" }
+    Можно передать days вручную (override), если нужен нестандартный срок.
+    """
+    data = await request.json()
+    plan  = (data.get("plan") or "").lower()
+    count = int(data.get("count") or 1)
+    note  = (data.get("note") or "").strip() or None
+    days  = data.get("days")
+
+    if plan not in PLAN_DAYS_MAP and days is None:
+        raise HTTPException(400, "plan должен быть одним из: month, quarter, lifetime, hwid_reset")
+    if count < 1 or count > 500:
+        raise HTTPException(400, "count: 1..500")
+
+    if days is None and plan != "hwid_reset":
+        days = PLAN_DAYS_MAP[plan]
+    if plan == "hwid_reset":
+        days = 0
+
+    generated = []
+    for _ in range(count):
+        # уникальный код (на коллизии retry)
+        for _attempt in range(10):
+            code = _generate_key_code()
+            existing = await database.fetch_one(keys.select().where(keys.c.code == code))
+            if not existing:
+                break
+        else:
+            raise HTTPException(500, "Не удалось сгенерировать уникальный код")
+
+        await database.execute(keys.insert().values(
+            code=code,
+            plan=plan,
+            days=days,
+            note=note,
+        ))
+        generated.append(code)
+
+    return {"success": True, "count": len(generated), "keys": generated}
+
+
+@app.post("/api/admin/keys/delete")
+async def admin_delete_key(request: Request, admin=Depends(require_admin)):
+    """Удалить ключ по id (если ещё не активирован — он пропадает; если активирован — подписка остаётся)."""
+    data = await request.json()
+    key_id = data.get("id")
+    if not key_id:
+        raise HTTPException(400, "id required")
+    await database.execute(keys.delete().where(keys.c.id == key_id))
+    return {"success": True}
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
