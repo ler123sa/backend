@@ -90,6 +90,17 @@ loader_versions = sqlalchemy.Table(
     sqlalchemy.Column("active",     sqlalchemy.Boolean,     default=True),
 )
 
+launch_tokens = sqlalchemy.Table(
+    "launch_tokens", metadata,
+    sqlalchemy.Column("id",         sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("token",      sqlalchemy.String(128), unique=True, nullable=False),
+    sqlalchemy.Column("user_id",    sqlalchemy.Integer, sqlalchemy.ForeignKey("users.id"), nullable=False),
+    sqlalchemy.Column("hwid",       sqlalchemy.String(128), nullable=True),
+    sqlalchemy.Column("created_at", sqlalchemy.DateTime,    default=datetime.utcnow),
+    sqlalchemy.Column("expires_at", sqlalchemy.DateTime,    nullable=False),
+    sqlalchemy.Column("used",       sqlalchemy.Boolean,     default=False),
+)
+
 # ─── Schema (raw SQL, чтобы создать таблицы тем же asyncpg-соединением) ──────
 def _schema_sql() -> list[str]:
     if IS_POSTGRES:
@@ -166,6 +177,18 @@ def _schema_sql() -> list[str]:
             )
             """,
             "CREATE INDEX IF NOT EXISTS idx_loader_active ON loader_versions(active)",
+            """
+            CREATE TABLE IF NOT EXISTS launch_tokens (
+                id         SERIAL PRIMARY KEY,
+                token      VARCHAR(128) UNIQUE NOT NULL,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                hwid       VARCHAR(128),
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                expires_at TIMESTAMP NOT NULL,
+                used       BOOLEAN DEFAULT FALSE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_launch_tokens_token ON launch_tokens(token)",
         ]
     else:
         return [
@@ -235,6 +258,18 @@ def _schema_sql() -> list[str]:
                 notes      TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 active     BOOLEAN DEFAULT 1
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS launch_tokens (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                token      VARCHAR(128) UNIQUE NOT NULL,
+                user_id    INTEGER NOT NULL,
+                hwid       VARCHAR(128),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                used       BOOLEAN DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id)
             )
             """,
         ]
@@ -500,8 +535,18 @@ async def launcher_check(request: Request, user=Depends(get_current_user)):
     if not sub:
         raise HTTPException(403, "No active subscription")
 
-    # Генерируем одноразовый launch token
-    launch_token = secrets.token_hex(32)
+    # Генерируем одноразовый launch token (действует 60 секунд)
+    launch_token = secrets.token_hex(48)
+    expires = datetime.utcnow() + timedelta(seconds=60)
+
+    # Сохраняем в БД
+    await database.execute(launch_tokens.insert().values(
+        token=launch_token,
+        user_id=user["id"],
+        hwid=hwid,
+        expires_at=expires,
+        used=False,
+    ))
 
     return {
         "allowed": True,
@@ -511,6 +556,62 @@ async def launcher_check(request: Request, user=Depends(get_current_user)):
             "username": user["username"],
             "role":     user["role"],
         },
+        "subscription": {
+            "plan":       sub["plan"],
+            "expires_at": sub["expires_at"].isoformat() if sub["expires_at"] else None,
+            "lifetime":   sub["expires_at"] is None,
+        }
+    }
+
+
+@app.post("/api/launcher/verify_token")
+async def launcher_verify_token(request: Request):
+    """
+    Мод вызывает это при старте — проверяет что launch_token валидный, свежий и одноразовый.
+    Не требует Bearer-токена — только launch_token + hwid.
+    """
+    data = await request.json()
+    launch_token = (data.get("launch_token") or "").strip()
+    hwid          = (data.get("hwid") or "").strip()
+    username      = (data.get("username") or "").strip()
+
+    if not launch_token:
+        raise HTTPException(400, "launch_token required")
+
+    lt = await database.fetch_one(
+        launch_tokens.select().where(launch_tokens.c.token == launch_token)
+    )
+    if not lt:
+        raise HTTPException(403, "Invalid launch token")
+    if lt["used"]:
+        raise HTTPException(403, "Launch token already used")
+    if lt["expires_at"] < datetime.utcnow():
+        raise HTTPException(403, "Launch token expired")
+
+    # Проверяем HWID если передан
+    if hwid and lt["hwid"] and lt["hwid"] != hwid:
+        raise HTTPException(403, "HWID mismatch")
+
+    # Помечаем токен как использованный (одноразовый)
+    await database.execute(
+        launch_tokens.update()
+        .where(launch_tokens.c.id == lt["id"])
+        .values(used=True)
+    )
+
+    # Проверяем подписку
+    sub = await get_active_subscription(lt["user_id"])
+    if not sub:
+        raise HTTPException(403, "No active subscription")
+
+    user = await database.fetch_one(users.select().where(users.c.id == lt["user_id"]))
+    if not user or user["banned"]:
+        raise HTTPException(403, "Account banned")
+
+    return {
+        "allowed": True,
+        "username": user["username"],
+        "role":     user["role"],
         "subscription": {
             "plan":       sub["plan"],
             "expires_at": sub["expires_at"].isoformat() if sub["expires_at"] else None,
