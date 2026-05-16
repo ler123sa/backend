@@ -80,6 +80,16 @@ keys = sqlalchemy.Table(
     sqlalchemy.Column("activated_by",sqlalchemy.Integer,     sqlalchemy.ForeignKey("users.id"), nullable=True),
 )
 
+loader_versions = sqlalchemy.Table(
+    "loader_versions", metadata,
+    sqlalchemy.Column("id",         sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("version",    sqlalchemy.String(32),  nullable=False),
+    sqlalchemy.Column("url",        sqlalchemy.String(512), nullable=False),  # прямая ссылка на exe
+    sqlalchemy.Column("notes",      sqlalchemy.Text,        nullable=True),
+    sqlalchemy.Column("created_at", sqlalchemy.DateTime,    default=datetime.utcnow),
+    sqlalchemy.Column("active",     sqlalchemy.Boolean,     default=True),
+)
+
 # ─── Schema (raw SQL, чтобы создать таблицы тем же asyncpg-соединением) ──────
 def _schema_sql() -> list[str]:
     if IS_POSTGRES:
@@ -145,6 +155,17 @@ def _schema_sql() -> list[str]:
             """,
             "CREATE INDEX IF NOT EXISTS idx_keys_code         ON keys(code)",
             "CREATE INDEX IF NOT EXISTS idx_keys_activated_by ON keys(activated_by)",
+            """
+            CREATE TABLE IF NOT EXISTS loader_versions (
+                id         SERIAL PRIMARY KEY,
+                version    VARCHAR(32)  NOT NULL,
+                url        VARCHAR(512) NOT NULL,
+                notes      TEXT,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                active     BOOLEAN DEFAULT TRUE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_loader_active ON loader_versions(active)",
         ]
     else:
         return [
@@ -204,6 +225,16 @@ def _schema_sql() -> list[str]:
                 activated_at  DATETIME,
                 activated_by  INTEGER,
                 FOREIGN KEY(activated_by) REFERENCES users(id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS loader_versions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                version    VARCHAR(32)  NOT NULL,
+                url        VARCHAR(512) NOT NULL,
+                notes      TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                active     BOOLEAN DEFAULT 1
             )
             """,
         ]
@@ -994,6 +1025,92 @@ async def admin_delete_key(request: Request, admin=Depends(require_admin)):
         raise HTTPException(400, "id required")
     await database.execute(keys.delete().where(keys.c.id == key_id))
     return {"success": True}
+
+
+# ─── Loader versions (exe лоудера) ────────────────────────────────────────────
+@app.get("/api/loader/version")
+async def loader_version_public():
+    """
+    Публичный endpoint — для кнопки "Скачать" на сайте и для самого лоудера.
+    Возвращает актуальную версию exe и URL.
+    """
+    rel = await database.fetch_one(
+        loader_versions.select().where(loader_versions.c.active == True)
+        .order_by(loader_versions.c.created_at.desc())
+    )
+    if not rel:
+        raise HTTPException(404, "No active loader version")
+    return {
+        "version":    rel["version"],
+        "url":        rel["url"],
+        "notes":      rel["notes"] or "",
+        "created_at": rel["created_at"].isoformat() if rel["created_at"] else None,
+    }
+
+
+@app.get("/api/admin/loader/versions")
+async def admin_list_loader_versions(admin=Depends(require_admin)):
+    rows = await database.fetch_all(
+        loader_versions.select().order_by(loader_versions.c.created_at.desc())
+    )
+    return [
+        {
+            "id":         r["id"],
+            "version":    r["version"],
+            "url":        r["url"],
+            "notes":      r["notes"],
+            "active":     r["active"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/admin/loader/create")
+async def admin_create_loader_version(request: Request, admin=Depends(require_admin)):
+    """Создать новую версию лоудера. Все остальные становятся неактивными."""
+    data = await request.json()
+    version = (data.get("version") or "").strip()
+    url     = (data.get("url") or "").strip()
+    notes   = (data.get("notes") or "").strip()
+
+    if not version or not url:
+        raise HTTPException(400, "version и url обязательны")
+
+    await database.execute(loader_versions.update().values(active=False))
+    rid = await database.execute(loader_versions.insert().values(
+        version=version,
+        url=url,
+        notes=notes,
+        active=True,
+    ))
+    return {"success": True, "id": rid, "message": f"Лоудер v{version} активирован"}
+
+
+@app.post("/api/admin/loader/delete")
+async def admin_delete_loader_version(request: Request, admin=Depends(require_admin)):
+    data = await request.json()
+    rid = data.get("id")
+    if not rid:
+        raise HTTPException(400, "id required")
+    await database.execute(loader_versions.delete().where(loader_versions.c.id == rid))
+    return {"success": True}
+
+
+@app.post("/api/admin/loader/activate")
+async def admin_activate_loader_version(request: Request, admin=Depends(require_admin)):
+    data = await request.json()
+    rid = data.get("id")
+    if not rid:
+        raise HTTPException(400, "id required")
+    rel = await database.fetch_one(loader_versions.select().where(loader_versions.c.id == rid))
+    if not rel:
+        raise HTTPException(404, "Version not found")
+    await database.execute(loader_versions.update().values(active=False))
+    await database.execute(
+        loader_versions.update().where(loader_versions.c.id == rid).values(active=True)
+    )
+    return {"success": True, "message": f"Лоудер v{rel['version']} активирован"}
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
