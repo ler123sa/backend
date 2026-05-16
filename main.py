@@ -1402,6 +1402,53 @@ async def admin_payload_delete(request: Request, admin=Depends(require_admin)):
     return {"success": True}
 
 
+@app.get("/api/admin/payload/test_url")
+async def admin_payload_test_url(admin=Depends(require_admin)):
+    """
+    Диагностика: возвращает presigned URL активного payload и пробует скачать его.
+    Показывает что именно идёт не так — Bucket creds, presign формат, или сеть.
+    """
+    p = await database.fetch_one(
+        payloads.select().where(payloads.c.active == True)
+    )
+    if not p:
+        return {"ok": False, "step": "find_active", "error": "no active payload"}
+
+    if not payload_storage.is_configured():
+        return {"ok": False, "step": "config", "error": "bucket not configured"}
+
+    try:
+        url = payload_storage.presigned_get(p["bucket_key"], ttl=300)
+    except Exception as e:
+        return {"ok": False, "step": "presign", "error": f"{type(e).__name__}: {e}"}
+
+    # Пробуем скачать с самого backend'а — проверка что URL рабочий
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "GlitchDLC-Diag/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+            content_length = resp.headers.get("Content-Length")
+        return {
+            "ok": True,
+            "bucket_key":         p["bucket_key"],
+            "expected_size":      p["size_bytes"],
+            "downloaded_bytes":   len(data),
+            "size_match":         len(data) == p["size_bytes"],
+            "content_length_hdr": content_length,
+            "url_preview":        url[:120] + "..." if len(url) > 120 else url,
+            "addressing":         payload_storage.BUCKET_ADDRESSING,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "step": "download",
+            "error": f"{type(e).__name__}: {e}",
+            "url_preview": url[:120] + "..." if len(url) > 120 else url,
+            "addressing":  payload_storage.BUCKET_ADDRESSING,
+        }
+
+
 @app.post("/api/launcher/payload")
 async def launcher_payload(request: Request):
     """
