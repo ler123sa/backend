@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
@@ -9,6 +9,9 @@ import hashlib
 import secrets
 import os
 import re
+
+import payload_crypto
+import payload_storage
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./glitchdlc.db")
@@ -101,6 +104,22 @@ launch_tokens = sqlalchemy.Table(
     sqlalchemy.Column("used",       sqlalchemy.Boolean,     default=False),
 )
 
+# Зашифрованные payload'ы чита (jar после grunt+proguard+remap).
+# В Bucket лежит один зашифрованный файл, в DB только обёрнутый DEK + метаданные.
+payloads = sqlalchemy.Table(
+    "payloads", metadata,
+    sqlalchemy.Column("id",            sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("version",       sqlalchemy.String(32),  unique=True, nullable=False),
+    sqlalchemy.Column("bucket_key",    sqlalchemy.String(256), nullable=False),
+    sqlalchemy.Column("payload_nonce", sqlalchemy.LargeBinary, nullable=False),  # 12 байт
+    sqlalchemy.Column("dek_wrapped",   sqlalchemy.LargeBinary, nullable=False),  # nonce(12) || ct (master-wrapped)
+    sqlalchemy.Column("size_bytes",    sqlalchemy.Integer,     nullable=False),
+    sqlalchemy.Column("sha256",        sqlalchemy.String(64),  nullable=False),  # hex чистого jar (для аудита)
+    sqlalchemy.Column("notes",         sqlalchemy.Text,        nullable=True),
+    sqlalchemy.Column("created_at",    sqlalchemy.DateTime,    default=datetime.utcnow),
+    sqlalchemy.Column("active",        sqlalchemy.Boolean,     default=True),
+)
+
 # ─── Schema (raw SQL, чтобы создать таблицы тем же asyncpg-соединением) ──────
 def _schema_sql() -> list[str]:
     if IS_POSTGRES:
@@ -189,6 +208,21 @@ def _schema_sql() -> list[str]:
             )
             """,
             "CREATE INDEX IF NOT EXISTS idx_launch_tokens_token ON launch_tokens(token)",
+            """
+            CREATE TABLE IF NOT EXISTS payloads (
+                id            SERIAL PRIMARY KEY,
+                version       VARCHAR(32)  UNIQUE NOT NULL,
+                bucket_key    VARCHAR(256) NOT NULL,
+                payload_nonce BYTEA        NOT NULL,
+                dek_wrapped   BYTEA        NOT NULL,
+                size_bytes    INTEGER      NOT NULL,
+                sha256        VARCHAR(64)  NOT NULL,
+                notes         TEXT,
+                created_at    TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                active        BOOLEAN DEFAULT TRUE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_payloads_active ON payloads(active)",
         ]
     else:
         return [
@@ -272,6 +306,20 @@ def _schema_sql() -> list[str]:
                 FOREIGN KEY(user_id) REFERENCES users(id)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS payloads (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                version       VARCHAR(32)  UNIQUE NOT NULL,
+                bucket_key    VARCHAR(256) NOT NULL,
+                payload_nonce BLOB         NOT NULL,
+                dek_wrapped   BLOB         NOT NULL,
+                size_bytes    INTEGER      NOT NULL,
+                sha256        VARCHAR(64)  NOT NULL,
+                notes         TEXT,
+                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                active        BOOLEAN DEFAULT 1
+            )
+            """,
         ]
 
 
@@ -287,6 +335,11 @@ async def lifespan(app: FastAPI):
             await database.execute(stmt)
         print("[GlitchDLC] Tables created", flush=True)
         await ensure_owner()
+        try:
+            payload_storage.ensure_bucket()
+            print("[GlitchDLC] Bucket ready", flush=True)
+        except Exception as be:
+            print(f"[GlitchDLC] Bucket warning: {type(be).__name__}: {be}", flush=True)
         print("[GlitchDLC] Startup complete", flush=True)
     except Exception as e:
         print(f"[GlitchDLC] STARTUP ERROR: {type(e).__name__}: {e}", flush=True)
@@ -1212,6 +1265,250 @@ async def admin_activate_loader_version(request: Request, admin=Depends(require_
         loader_versions.update().where(loader_versions.c.id == rid).values(active=True)
     )
     return {"success": True, "message": f"Лоудер v{rel['version']} активирован"}
+
+
+# ─── Encrypted Payloads (in-memory loader stack) ─────────────────────────────
+@app.post("/api/admin/payload/upload")
+async def admin_upload_payload(
+    version: str = Form(...),
+    notes:   str = Form(""),
+    file:    UploadFile = File(...),
+    admin = Depends(require_admin),
+):
+    """
+    Заливает СЫРОЙ jar (после grunt+proguard+remap) в Bucket в зашифрованном виде.
+    На каждый запрос лоудера будет генериться сессионный ключ.
+
+    После загрузки этот payload становится активным (старые деактивируются).
+    """
+    version = version.strip()
+    if not version:
+        raise HTTPException(400, "version required")
+    if not payload_storage.is_configured():
+        raise HTTPException(500, "Bucket не сконфигурирован на сервере")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "empty file")
+    if len(raw) > 100 * 1024 * 1024:  # 100 MiB sanity
+        raise HTTPException(413, "payload too big")
+
+    sha = hashlib.sha256(raw).hexdigest()
+
+    # Если такая версия уже есть — обновляем
+    existing = await database.fetch_one(payloads.select().where(payloads.c.version == version))
+
+    enc = payload_crypto.encrypt_payload(raw)
+    bucket_key = f"payloads/{version}.bin"
+
+    try:
+        payload_storage.upload_payload(bucket_key, enc.ciphertext)
+    except Exception as e:
+        raise HTTPException(500, f"Bucket upload failed: {e}")
+
+    dek_master = payload_crypto.wrap_dek_for_master(enc.dek)
+
+    # Деактивируем все старые
+    await database.execute(payloads.update().values(active=False))
+
+    if existing:
+        await database.execute(
+            payloads.update().where(payloads.c.id == existing["id"]).values(
+                bucket_key=bucket_key,
+                payload_nonce=enc.nonce,
+                dek_wrapped=dek_master,
+                size_bytes=len(raw),
+                sha256=sha,
+                notes=notes or None,
+                active=True,
+            )
+        )
+        pid = existing["id"]
+    else:
+        pid = await database.execute(payloads.insert().values(
+            version=version,
+            bucket_key=bucket_key,
+            payload_nonce=enc.nonce,
+            dek_wrapped=dek_master,
+            size_bytes=len(raw),
+            sha256=sha,
+            notes=notes or None,
+            active=True,
+        ))
+
+    # Зануляем чувствительное в памяти процесса (best-effort)
+    enc.dek = b"\x00" * len(enc.dek)
+
+    return {
+        "success": True,
+        "id":         pid,
+        "version":    version,
+        "size_bytes": len(raw),
+        "sha256":     sha,
+        "bucket_key": bucket_key,
+    }
+
+
+@app.get("/api/admin/payload/list")
+async def admin_payload_list(admin=Depends(require_admin)):
+    rows = await database.fetch_all(
+        payloads.select().order_by(payloads.c.created_at.desc())
+    )
+    return [
+        {
+            "id":         p["id"],
+            "version":    p["version"],
+            "size_bytes": p["size_bytes"],
+            "sha256":     p["sha256"],
+            "active":     p["active"],
+            "notes":      p["notes"],
+            "bucket_key": p["bucket_key"],
+            "created_at": p["created_at"].isoformat() if p["created_at"] else None,
+        }
+        for p in rows
+    ]
+
+
+@app.post("/api/admin/payload/activate")
+async def admin_payload_activate(request: Request, admin=Depends(require_admin)):
+    data = await request.json()
+    pid = data.get("id")
+    if not pid:
+        raise HTTPException(400, "id required")
+    p = await database.fetch_one(payloads.select().where(payloads.c.id == pid))
+    if not p:
+        raise HTTPException(404, "Payload not found")
+    await database.execute(payloads.update().values(active=False))
+    await database.execute(
+        payloads.update().where(payloads.c.id == pid).values(active=True)
+    )
+    return {"success": True, "version": p["version"]}
+
+
+@app.post("/api/admin/payload/delete")
+async def admin_payload_delete(request: Request, admin=Depends(require_admin)):
+    data = await request.json()
+    pid = data.get("id")
+    if not pid:
+        raise HTTPException(400, "id required")
+    p = await database.fetch_one(payloads.select().where(payloads.c.id == pid))
+    if not p:
+        raise HTTPException(404, "Payload not found")
+    try:
+        payload_storage.delete_payload(p["bucket_key"])
+    except Exception:
+        pass
+    await database.execute(payloads.delete().where(payloads.c.id == pid))
+    return {"success": True}
+
+
+@app.post("/api/launcher/payload")
+async def launcher_payload(request: Request):
+    """
+    Лоудер вызывает после успешного /api/launcher/check.
+    Передаёт launch_token и hwid → получает:
+        - presigned URL зашифрованного payload в Bucket (TTL ~90с)
+        - DEK завёрнутый в KEK = HKDF(master, version, hwid, launch_token)
+        - nonce'ы для AES-GCM
+        - HMAC-подпись метаданных от master_secret
+
+    launch_token при этом помечается как использованный (одноразовый).
+    """
+    data = await request.json()
+    launch_token = (data.get("launch_token") or "").strip()
+    hwid         = (data.get("hwid") or "").strip()
+
+    if not launch_token or not hwid:
+        raise HTTPException(400, "launch_token и hwid обязательны")
+
+    lt = await database.fetch_one(
+        launch_tokens.select().where(launch_tokens.c.token == launch_token)
+    )
+    if not lt:
+        raise HTTPException(403, "Invalid launch token")
+    if lt["used"]:
+        raise HTTPException(403, "Launch token already used")
+    if lt["expires_at"] < datetime.utcnow():
+        raise HTTPException(403, "Launch token expired")
+    if lt["hwid"] and lt["hwid"] != hwid:
+        raise HTTPException(403, "HWID mismatch")
+
+    # Подписка обязательна
+    sub = await get_active_subscription(lt["user_id"])
+    if not sub:
+        raise HTTPException(403, "No active subscription")
+
+    user = await database.fetch_one(users.select().where(users.c.id == lt["user_id"]))
+    if not user or user["banned"]:
+        raise HTTPException(403, "Account banned")
+
+    # Активный payload
+    p = await database.fetch_one(
+        payloads.select().where(payloads.c.active == True).order_by(payloads.c.created_at.desc())
+    )
+    if not p:
+        raise HTTPException(503, "No active payload")
+    if not payload_storage.is_configured():
+        raise HTTPException(503, "Storage offline")
+
+    # Разворачиваем DEK из master-обёртки и заворачиваем под сессию
+    try:
+        dek_plain = payload_crypto.unwrap_dek_from_master(bytes(p["dek_wrapped"]))
+    except Exception as e:
+        raise HTTPException(500, f"DEK unwrap failed: {type(e).__name__}")
+
+    session_wrap = payload_crypto.wrap_dek_for_session(
+        dek_plain,
+        payload_version=p["version"],
+        hwid=hwid,
+        launch_token=launch_token,
+    )
+    # Зануляем
+    dek_plain = b"\x00" * len(dek_plain)
+
+    # Помечаем launch_token как использованный (одноразовый)
+    await database.execute(
+        launch_tokens.update()
+        .where(launch_tokens.c.id == lt["id"])
+        .values(used=True)
+    )
+
+    # Presigned URL живёт ~90с
+    try:
+        url = payload_storage.presigned_get(p["bucket_key"])
+    except Exception as e:
+        raise HTTPException(500, f"Presign failed: {type(e).__name__}")
+
+    # HMAC-подпись для лоудера: чтобы убедиться что url+ключи не подменили
+    sig = payload_crypto.integrity_signature(
+        p["version"],
+        url,
+        bytes(p["payload_nonce"]).hex(),
+        session_wrap.nonce.hex(),
+        session_wrap.wrapped.hex(),
+        hwid,
+        launch_token,
+    )
+
+    return {
+        "version":       p["version"],
+        "url":           url,
+        "size_bytes":    p["size_bytes"],
+        "sha256":        p["sha256"],
+        "payload_nonce": bytes(p["payload_nonce"]).hex(),
+        "dek_wrapped":   session_wrap.wrapped.hex(),
+        "dek_nonce":     session_wrap.nonce.hex(),
+        "signature":     sig,
+        "user": {
+            "username": user["username"],
+            "role":     user["role"],
+        },
+        "subscription": {
+            "plan":       sub["plan"],
+            "expires_at": sub["expires_at"].isoformat() if sub["expires_at"] else None,
+            "lifetime":   sub["expires_at"] is None,
+        },
+    }
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
