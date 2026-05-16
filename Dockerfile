@@ -5,8 +5,17 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
+# Системные зависимости для cryptography (на slim иногда нет ffi headers)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Гарантия что payload-зависимости стоят, даже если requirements.txt не обновился
+# в репозитории (страховка от Railway build cache).
+RUN pip install --no-cache-dir "boto3==1.34.131" "cryptography==42.0.8"
 
 COPY . .
 
