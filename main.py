@@ -58,6 +58,16 @@ sessions = sqlalchemy.Table(
     sqlalchemy.Column("expires_at", sqlalchemy.DateTime,    nullable=False),
 )
 
+releases = sqlalchemy.Table(
+    "releases", metadata,
+    sqlalchemy.Column("id",         sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("version",    sqlalchemy.String(32),  nullable=False),
+    sqlalchemy.Column("url",        sqlalchemy.String(512), nullable=False),
+    sqlalchemy.Column("notes",      sqlalchemy.Text,        nullable=True),
+    sqlalchemy.Column("created_at", sqlalchemy.DateTime,    default=datetime.utcnow),
+    sqlalchemy.Column("active",     sqlalchemy.Boolean,     default=True),
+)
+
 # ─── Schema (raw SQL, чтобы создать таблицы тем же asyncpg-соединением) ──────
 def _schema_sql() -> list[str]:
     if IS_POSTGRES:
@@ -98,6 +108,17 @@ def _schema_sql() -> list[str]:
             "CREATE INDEX IF NOT EXISTS idx_sessions_token   ON sessions(token)",
             "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
             "CREATE INDEX IF NOT EXISTS idx_subs_user_id     ON subscriptions(user_id)",
+            """
+            CREATE TABLE IF NOT EXISTS releases (
+                id         SERIAL PRIMARY KEY,
+                version    VARCHAR(32)  NOT NULL,
+                url        VARCHAR(512) NOT NULL,
+                notes      TEXT,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                active     BOOLEAN DEFAULT TRUE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_releases_active ON releases(active)",
         ]
     else:
         return [
@@ -134,6 +155,16 @@ def _schema_sql() -> list[str]:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 expires_at DATETIME NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS releases (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                version    VARCHAR(32)  NOT NULL,
+                url        VARCHAR(512) NOT NULL,
+                notes      TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                active     BOOLEAN DEFAULT 1
             )
             """,
         ]
@@ -663,6 +694,102 @@ async def admin_get_user(user_id: int, admin=Depends(require_admin)):
             for s in history
         ]
     }
+
+
+# ─── Releases / launcher updates ──────────────────────────────────────────────
+@app.get("/api/launcher/version")
+async def launcher_version():
+    """
+    Публичный endpoint — лоудер дёргает при старте.
+    Возвращает актуальную версию клиента и URL архива.
+    """
+    rel = await database.fetch_one(
+        releases.select().where(releases.c.active == True)
+        .order_by(releases.c.created_at.desc())
+    )
+    if not rel:
+        raise HTTPException(404, "No active release")
+    return {
+        "version":    rel["version"],
+        "url":        rel["url"],
+        "notes":      rel["notes"] or "",
+        "created_at": rel["created_at"].isoformat() if rel["created_at"] else None,
+    }
+
+
+@app.get("/api/admin/releases")
+async def admin_list_releases(admin=Depends(require_admin)):
+    """Список всех релизов (история)."""
+    rows = await database.fetch_all(
+        releases.select().order_by(releases.c.created_at.desc())
+    )
+    return [
+        {
+            "id":         r["id"],
+            "version":    r["version"],
+            "url":        r["url"],
+            "notes":      r["notes"],
+            "active":     r["active"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/admin/releases/create")
+async def admin_create_release(request: Request, admin=Depends(require_admin)):
+    """
+    Создать новый релиз. Все остальные становятся неактивными.
+    body: { version: "1.0.5", url: "https://...", notes: "what changed" }
+    """
+    data = await request.json()
+    version = (data.get("version") or "").strip()
+    url     = (data.get("url") or "").strip()
+    notes   = (data.get("notes") or "").strip()
+
+    if not version or not url:
+        raise HTTPException(400, "version и url обязательны")
+
+    # Все старые релизы в архив
+    await database.execute(releases.update().values(active=False))
+
+    rid = await database.execute(releases.insert().values(
+        version=version,
+        url=url,
+        notes=notes,
+        active=True,
+    ))
+
+    return {"success": True, "id": rid, "message": f"Релиз {version} активирован"}
+
+
+@app.post("/api/admin/releases/delete")
+async def admin_delete_release(request: Request, admin=Depends(require_admin)):
+    data = await request.json()
+    release_id = data.get("id")
+    if not release_id:
+        raise HTTPException(400, "id required")
+    await database.execute(releases.delete().where(releases.c.id == release_id))
+    return {"success": True}
+
+
+@app.post("/api/admin/releases/activate")
+async def admin_activate_release(request: Request, admin=Depends(require_admin)):
+    """Сделать конкретный релиз активным (откатить или вернуть прошлый)."""
+    data = await request.json()
+    release_id = data.get("id")
+    if not release_id:
+        raise HTTPException(400, "id required")
+
+    rel = await database.fetch_one(releases.select().where(releases.c.id == release_id))
+    if not rel:
+        raise HTTPException(404, "Release not found")
+
+    await database.execute(releases.update().values(active=False))
+    await database.execute(
+        releases.update().where(releases.c.id == release_id).values(active=True)
+    )
+    return {"success": True, "message": f"Релиз {rel['version']} активирован"}
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
