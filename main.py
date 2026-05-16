@@ -1464,14 +1464,9 @@ async def launcher_payload(request: Request):
     except Exception as e:
         raise HTTPException(500, f"DEK unwrap failed: {type(e).__name__}")
 
-    # Помечаем launch_token как использованный (одноразовый)
-    await database.execute(
-        launch_tokens.update()
-        .where(launch_tokens.c.id == lt["id"])
-        .values(used=True)
-    )
-
-    # Presigned URL живёт ~90с
+    # Презнэйкэд URL живёт ~90с
+    # NB: launch_token НЕ помечается used здесь — это сделает /api/launcher/verify_token
+    # при старте мода. Так у нас двойная верификация: и при загрузке payload, и при старте.
     try:
         url = payload_storage.presigned_get(p["bucket_key"])
     except Exception as e:
