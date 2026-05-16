@@ -93,6 +93,20 @@ loader_versions = sqlalchemy.Table(
     sqlalchemy.Column("active",     sqlalchemy.Boolean,     default=True),
 )
 
+# Stub-jar версии — Fabric-мод, который лоудер кладёт в mods/ перед запуском игры.
+# Хранится как прямая URL-ссылка (не шифруется — это публичная оболочка).
+stub_versions = sqlalchemy.Table(
+    "stub_versions", metadata,
+    sqlalchemy.Column("id",         sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("version",    sqlalchemy.String(32),  nullable=False),
+    sqlalchemy.Column("url",        sqlalchemy.String(512), nullable=False),
+    sqlalchemy.Column("sha256",     sqlalchemy.String(64),  nullable=True),   # для кеширования у клиента
+    sqlalchemy.Column("size_bytes", sqlalchemy.Integer,     nullable=True),
+    sqlalchemy.Column("notes",      sqlalchemy.Text,        nullable=True),
+    sqlalchemy.Column("created_at", sqlalchemy.DateTime,    default=datetime.utcnow),
+    sqlalchemy.Column("active",     sqlalchemy.Boolean,     default=True),
+)
+
 launch_tokens = sqlalchemy.Table(
     "launch_tokens", metadata,
     sqlalchemy.Column("id",         sqlalchemy.Integer, primary_key=True),
@@ -197,6 +211,19 @@ def _schema_sql() -> list[str]:
             """,
             "CREATE INDEX IF NOT EXISTS idx_loader_active ON loader_versions(active)",
             """
+            CREATE TABLE IF NOT EXISTS stub_versions (
+                id         SERIAL PRIMARY KEY,
+                version    VARCHAR(32)  NOT NULL,
+                url        VARCHAR(512) NOT NULL,
+                sha256     VARCHAR(64),
+                size_bytes INTEGER,
+                notes      TEXT,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                active     BOOLEAN DEFAULT TRUE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_stub_active ON stub_versions(active)",
+            """
             CREATE TABLE IF NOT EXISTS launch_tokens (
                 id         SERIAL PRIMARY KEY,
                 token      VARCHAR(128) UNIQUE NOT NULL,
@@ -289,6 +316,18 @@ def _schema_sql() -> list[str]:
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 version    VARCHAR(32)  NOT NULL,
                 url        VARCHAR(512) NOT NULL,
+                notes      TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                active     BOOLEAN DEFAULT 1
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS stub_versions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                version    VARCHAR(32)  NOT NULL,
+                url        VARCHAR(512) NOT NULL,
+                sha256     VARCHAR(64),
+                size_bytes INTEGER,
                 notes      TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 active     BOOLEAN DEFAULT 1
@@ -1265,6 +1304,106 @@ async def admin_activate_loader_version(request: Request, admin=Depends(require_
         loader_versions.update().where(loader_versions.c.id == rid).values(active=True)
     )
     return {"success": True, "message": f"Лоудер v{rel['version']} активирован"}
+
+
+# ─── Stub versions (Fabric-мод, лоудер кладёт в mods/) ───────────────────────
+@app.get("/api/launcher/stub")
+async def launcher_stub():
+    """
+    Публичный endpoint — лоудер качает активный stub.jar.
+    Возвращает прямую ссылку и sha256 (для кеширования по содержимому).
+    """
+    s = await database.fetch_one(
+        stub_versions.select().where(stub_versions.c.active == True)
+        .order_by(stub_versions.c.created_at.desc())
+    )
+    if not s:
+        raise HTTPException(404, "No active stub")
+    return {
+        "version":    s["version"],
+        "url":        s["url"],
+        "sha256":     s["sha256"],
+        "size_bytes": s["size_bytes"],
+        "notes":      s["notes"] or "",
+        "created_at": s["created_at"].isoformat() if s["created_at"] else None,
+    }
+
+
+@app.get("/api/admin/stub/list")
+async def admin_list_stub_versions(admin=Depends(require_admin)):
+    rows = await database.fetch_all(
+        stub_versions.select().order_by(stub_versions.c.created_at.desc())
+    )
+    return [
+        {
+            "id":         r["id"],
+            "version":    r["version"],
+            "url":        r["url"],
+            "sha256":     r["sha256"],
+            "size_bytes": r["size_bytes"],
+            "notes":      r["notes"],
+            "active":     r["active"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/admin/stub/create")
+async def admin_create_stub_version(request: Request, admin=Depends(require_admin)):
+    """
+    Создать новую версию stub'а. Все остальные становятся неактивными.
+    body: { version, url, sha256?, size_bytes?, notes? }
+    sha256 опционален — если не передан, лоудер скачает и проверит после.
+    """
+    data = await request.json()
+    version    = (data.get("version") or "").strip()
+    url        = (data.get("url") or "").strip()
+    sha256     = (data.get("sha256") or "").strip() or None
+    size_bytes = data.get("size_bytes")
+    notes      = (data.get("notes") or "").strip()
+
+    if not version or not url:
+        raise HTTPException(400, "version и url обязательны")
+    if sha256 and len(sha256) != 64:
+        raise HTTPException(400, "sha256 должен быть 64 hex-символа")
+
+    await database.execute(stub_versions.update().values(active=False))
+    sid = await database.execute(stub_versions.insert().values(
+        version=version,
+        url=url,
+        sha256=sha256.lower() if sha256 else None,
+        size_bytes=int(size_bytes) if size_bytes else None,
+        notes=notes,
+        active=True,
+    ))
+    return {"success": True, "id": sid, "message": f"Stub v{version} активирован"}
+
+
+@app.post("/api/admin/stub/delete")
+async def admin_delete_stub_version(request: Request, admin=Depends(require_admin)):
+    data = await request.json()
+    sid = data.get("id")
+    if not sid:
+        raise HTTPException(400, "id required")
+    await database.execute(stub_versions.delete().where(stub_versions.c.id == sid))
+    return {"success": True}
+
+
+@app.post("/api/admin/stub/activate")
+async def admin_activate_stub_version(request: Request, admin=Depends(require_admin)):
+    data = await request.json()
+    sid = data.get("id")
+    if not sid:
+        raise HTTPException(400, "id required")
+    s = await database.fetch_one(stub_versions.select().where(stub_versions.c.id == sid))
+    if not s:
+        raise HTTPException(404, "Stub version not found")
+    await database.execute(stub_versions.update().values(active=False))
+    await database.execute(
+        stub_versions.update().where(stub_versions.c.id == sid).values(active=True)
+    )
+    return {"success": True, "message": f"Stub v{s['version']} активирован"}
 
 
 # ─── Encrypted Payloads (in-memory loader stack) ─────────────────────────────
