@@ -21,7 +21,7 @@ BUCKET_NAME       = os.getenv("BUCKET_NAME") or os.getenv("RAILWAY_BUCKET_NAME")
 BUCKET_REGION     = os.getenv("BUCKET_REGION", "us-east-1")
 # Стиль адресации: "path" (https://endpoint/bucket/key) или "virtual" (https://bucket.endpoint/key).
 # Railway Bucket (R2/S3-совместимый под капотом) хочет virtual-hosted style.
-BUCKET_ADDRESSING = os.getenv("BUCKET_ADDRESSING", "virtual").lower()
+BUCKET_ADDRESSING = os.getenv("BUCKET_ADDRESSING", "path").lower()
 
 # presigned URL живёт совсем недолго — лоудер должен скачать сразу.
 PRESIGN_TTL_SECONDS = 90
