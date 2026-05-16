@@ -1308,6 +1308,10 @@ async def admin_upload_payload(
 
     dek_master = payload_crypto.wrap_dek_for_master(enc.dek)
 
+    # size_bytes — размер того что РЕАЛЬНО лежит в Bucket (ciphertext + GCM tag),
+    # потому что лоудер качает именно его и ему нужно знать сколько байт ждать.
+    encrypted_size = len(enc.ciphertext)
+
     # Деактивируем все старые
     await database.execute(payloads.update().values(active=False))
 
@@ -1317,7 +1321,7 @@ async def admin_upload_payload(
                 bucket_key=bucket_key,
                 payload_nonce=enc.nonce,
                 dek_wrapped=dek_master,
-                size_bytes=len(raw),
+                size_bytes=encrypted_size,
                 sha256=sha,
                 notes=notes or None,
                 active=True,
@@ -1330,7 +1334,7 @@ async def admin_upload_payload(
             bucket_key=bucket_key,
             payload_nonce=enc.nonce,
             dek_wrapped=dek_master,
-            size_bytes=len(raw),
+            size_bytes=encrypted_size,
             sha256=sha,
             notes=notes or None,
             active=True,
@@ -1340,12 +1344,13 @@ async def admin_upload_payload(
     enc.dek = b"\x00" * len(enc.dek)
 
     return {
-        "success": True,
-        "id":         pid,
-        "version":    version,
-        "size_bytes": len(raw),
-        "sha256":     sha,
-        "bucket_key": bucket_key,
+        "success":         True,
+        "id":              pid,
+        "version":         version,
+        "raw_size":        len(raw),
+        "encrypted_size":  encrypted_size,
+        "sha256":          sha,
+        "bucket_key":      bucket_key,
     }
 
 
