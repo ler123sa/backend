@@ -15,8 +15,13 @@ from botocore.exceptions import ClientError
 BUCKET_ENDPOINT   = os.getenv("BUCKET_ENDPOINT", "").rstrip("/")
 BUCKET_ACCESS_KEY = os.getenv("BUCKET_ACCESS_KEY", "")
 BUCKET_SECRET_KEY = os.getenv("BUCKET_SECRET_KEY", "")
-BUCKET_NAME       = os.getenv("BUCKET_NAME", "glitchdlc-payloads")
+# Имя бакета: BUCKET_NAME основной, RAILWAY_BUCKET_NAME — как фоллбэк
+# (Railway автоматически инжектит RAILWAY_BUCKET_NAME при добавлении Bucket в проект).
+BUCKET_NAME       = os.getenv("BUCKET_NAME") or os.getenv("RAILWAY_BUCKET_NAME") or "glitchdlc-payloads"
 BUCKET_REGION     = os.getenv("BUCKET_REGION", "us-east-1")
+# Стиль адресации: "path" (https://endpoint/bucket/key) или "virtual" (https://bucket.endpoint/key).
+# Railway Bucket (R2/S3-совместимый под капотом) хочет virtual-hosted style.
+BUCKET_ADDRESSING = os.getenv("BUCKET_ADDRESSING", "virtual").lower()
 
 # presigned URL живёт совсем недолго — лоудер должен скачать сразу.
 PRESIGN_TTL_SECONDS = 90
@@ -37,14 +42,21 @@ def _client():
         aws_access_key_id=BUCKET_ACCESS_KEY,
         aws_secret_access_key=BUCKET_SECRET_KEY,
         region_name=BUCKET_REGION,
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual" if BUCKET_ADDRESSING == "virtual" else "path"},
+        ),
     )
 
 
 def ensure_bucket() -> None:
     """Создаёт bucket если его нет (идемпотентно)."""
     if not is_configured():
-        return
+        # Чтобы в логах было ясно почему payload не работает
+        raise RuntimeError(
+            "Bucket env vars not set: BUCKET_ENDPOINT / BUCKET_ACCESS_KEY / "
+            "BUCKET_SECRET_KEY / BUCKET_NAME"
+        )
     s3 = _client()
     try:
         s3.head_bucket(Bucket=BUCKET_NAME)
