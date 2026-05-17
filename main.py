@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import databases
@@ -1676,6 +1676,7 @@ async def launcher_payload(request: Request):
     response = {
         "version":       p["version"],
         "url":           url,
+        "proxy_url":     f"/api/launcher/payload_stream/{launch_token}",
         "size_bytes":    p["size_bytes"],
         "sha256":        p["sha256"],
         "payload_nonce": payload_nonce_hex,
@@ -1694,6 +1695,68 @@ async def launcher_payload(request: Request):
     # Зануляем после формирования ответа
     dek_plain = b"\x00" * len(dek_plain)
     return response
+
+
+@app.get("/api/launcher/payload_stream/{launch_token}")
+async def launcher_payload_stream(launch_token: str, request: Request):
+    """
+    Прокси-стрим: для российских юзеров у которых прямой Bucket URL медленно тянется
+    или режется ISP. Backend сам качает из Bucket и стримит клиенту.
+
+    Авторизация — по тому же одноразовому launch_token что выдан /api/launcher/payload.
+    Токен проверяется без 'used'-флага: на этой стадии lt уже мог быть помечен used'ом,
+    мы лишь убеждаемся что он привязан к payload и не expired-сильно.
+    """
+    if not launch_token:
+        raise HTTPException(400, "launch_token required")
+
+    lt = await database.fetch_one(
+        launch_tokens.select().where(launch_tokens.c.token == launch_token)
+    )
+    if not lt:
+        raise HTTPException(403, "Invalid launch token")
+    # +5 минут окно после expires — клиент мог отдать token и быстро дёрнуть прокси
+    if lt["expires_at"] < datetime.utcnow() - timedelta(minutes=5):
+        raise HTTPException(403, "Launch token expired")
+
+    p = await database.fetch_one(
+        payloads.select().where(payloads.c.active == True).order_by(payloads.c.created_at.desc())
+    )
+    if not p:
+        raise HTTPException(503, "No active payload")
+
+    if not payload_storage.is_configured():
+        raise HTTPException(503, "Storage offline")
+
+    try:
+        url = payload_storage.presigned_get(p["bucket_key"], ttl=180)
+    except Exception as e:
+        raise HTTPException(500, f"Presign failed: {type(e).__name__}")
+
+    # Качаем стримом из Bucket и пробрасываем клиенту чанками.
+    import urllib.request
+
+    def iter_payload():
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "GlitchDLC-Proxy/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        except Exception as e:
+            print(f"[GlitchDLC] proxy stream error: {type(e).__name__}: {e}", flush=True)
+            return
+
+    return StreamingResponse(
+        iter_payload(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(p["size_bytes"]),
+            "Cache-Control":  "no-store",
+        },
+    )
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
